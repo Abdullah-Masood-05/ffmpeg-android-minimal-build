@@ -58,7 +58,7 @@ done
 JOBS="${JOBS:-$(nproc)}"
 
 # ---- pinned sources from the lock --------------------------------------------------------------------
-# Lines: outDir<TAB>cacheDir, then name<TAB>version<TAB>url<TAB>sha256 for ffmpeg, lame, opus.
+# Lines: outDir<TAB>cacheDir, then name<TAB>version<TAB>urls (space-separated: url, then mirrors)<TAB>sha256.
 LOCKINFO="$(python3 - "$LOCK" <<'PY'
 import json, sys
 a = json.load(open(sys.argv[1]))
@@ -68,7 +68,8 @@ for k in ("ffmpeg", "lame", "opus"):
     sha = s.get("sha256", "").strip().lower()
     if len(sha) != 64:
         sys.exit("sources.lock.json sources.%s has no sha256; refusing to build from an unverified tarball" % k)
-    print("\t".join([k, s["version"], s["url"], sha]))
+    urls = [s["url"]] + list(s.get("mirrors", []))
+    print("\t".join([k, s["version"], " ".join(urls), sha]))
 PY
 )" || die "cannot read $LOCK"
 
@@ -85,19 +86,28 @@ DEPS="$WORK_DIR/deps"
 mkdir -p "$WORK_DIR/dl" "$DEPS"
 
 # Download, verify, extract. Sets FFMPEG_SRC / LAME_SRC / OPUS_SRC.
-while IFS=$'\t' read -r name version url sha; do
-  file="$(basename "$url")"
-  echo ">> $name $version: $url"
-  # Re-download on a hash mismatch too (a mirror may serve an HTML page with 200 OK).
+while IFS=$'\t' read -r name version urls sha; do
+  read -r -a candidates <<< "$urls"
+  file="$(basename "${candidates[0]}")"
+  echo ">> $name $version"
+  # Try the main url, then each mirror. Every copy must match the pinned sha256, so a mirror can
+  # only stand in for a byte-identical file. Re-download on a mismatch too (a mirror may serve an
+  # HTML page with 200 OK).
   got=""
-  for attempt in 1 2 3; do
-    curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -o "$WORK_DIR/dl/$file" "$url" || die "download failed: $url"
-    got="$(sha256sum "$WORK_DIR/dl/$file" | cut -d' ' -f1)"
-    [ "$got" = "$sha" ] && break
-    echo "   sha256 mismatch for $file (attempt $attempt): got $got" >&2
-    sleep 5
+  for url in "${candidates[@]}"; do
+    echo "   from $url"
+    for attempt in 1 2; do
+      if curl -fsSL --retry 3 --retry-all-errors --retry-delay 3 --connect-timeout 20 -o "$WORK_DIR/dl/$file" "$url"; then
+        got="$(sha256sum "$WORK_DIR/dl/$file" | cut -d' ' -f1)"
+        [ "$got" = "$sha" ] && break 2
+        echo "   sha256 mismatch for $file (attempt $attempt): got $got" >&2
+      else
+        echo "   download failed (attempt $attempt)" >&2
+      fi
+      sleep 3
+    done
   done
-  [ "$got" = "$sha" ] || die "sha256 mismatch for $file: expected $sha, got $got"
+  [ "$got" = "$sha" ] || die "could not get a verified $file from: $urls"
   echo "   sha256 OK ($got)"
   cp -f "$WORK_DIR/dl/$file" "$SOURCES/$file"
   mkdir -p "$WORK_DIR/src/$name"

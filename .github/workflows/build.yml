@@ -1,0 +1,93 @@
+# Builds libffmpeg-android-arm64-v8a.so (minimal LGPL FFmpeg 7.1.1 + LAME + Opus, NDK, API 24) and,
+# on v* tags, publishes it with SHA256SUMS.txt and the exact corresponding source (LGPL-2.1 s.6).
+# Consumers (Keepsake) pin a release tag and verify the hash from SHA256SUMS.txt.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: "27.2.12479018" # r27c, same as Keepsake's Android build
+
+jobs:
+  android-arm64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android NDK
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMANAGER" ] || SDKMANAGER="$(command -v sdkmanager)"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "ndk;$NDK_VERSION" > /dev/null
+          echo "ANDROID_NDK_HOME=$SDK/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Build (build.sh)
+        run: bash build.sh
+
+      - name: Package release assets
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/release"
+          mkdir -p "$OUT"
+          cp dist/libffmpeg.so "$OUT/libffmpeg-android-arm64-v8a.so"
+          # 64-bit little-endian AArch64 ELF, checked again here so a broken file never ships.
+          python3 - "$OUT/libffmpeg-android-arm64-v8a.so" <<'PY'
+          import struct, sys
+          b = open(sys.argv[1], "rb").read(64)
+          if b[:4] != b"\x7fELF" or b[4] != 2 or b[5] != 1 or struct.unpack_from("<H", b, 18)[0] != 183:
+              sys.exit("::error::not a 64-bit little-endian AArch64 ELF")
+          PY
+          # Corresponding source: the verified upstream tarballs, build.sh and the lock it read.
+          tar -C cache -czf "$OUT/libffmpeg-android-sources.tar.gz" sources
+          (cd "$OUT" && sha256sum libffmpeg-android-arm64-v8a.so libffmpeg-android-sources.tar.gz > SHA256SUMS.txt)
+          cat "$OUT/SHA256SUMS.txt"
+          {
+            echo "### libffmpeg-android-arm64-v8a.so"
+            echo ""
+            echo "| File | Bytes | SHA-256 |"
+            echo "|---|---|---|"
+            for f in "$OUT"/*; do
+              echo "| $(basename "$f") | $(stat -c %s "$f") | \`$(sha256sum "$f" | cut -d' ' -f1)\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libffmpeg-android-arm64-v8a
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: android-arm64
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: libffmpeg-android-arm64-v8a
+          path: release
+
+      - name: Verify checksums
+        run: cd release && sha256sum -c SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
